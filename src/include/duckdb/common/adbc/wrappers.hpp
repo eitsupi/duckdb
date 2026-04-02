@@ -13,6 +13,8 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/vector.hpp"
 
+#include <mutex>
+
 namespace duckdb_adbc {
 struct DuckDBAdbcStreamWrapper;
 } // namespace duckdb_adbc
@@ -22,6 +24,8 @@ namespace duckdb {
 struct DuckDBAdbcConnectionWrapper {
 	duckdb_connection connection;
 	unordered_map<string, string> options;
+	//! Mutex protecting active_streams from concurrent access (e.g. GC finalizer threads)
+	std::mutex active_streams_mutex;
 	//! Active stream wrappers on this connection (for materialization on concurrent execute)
 	vector<duckdb_adbc::DuckDBAdbcStreamWrapper *> active_streams;
 };

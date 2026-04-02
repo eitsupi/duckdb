@@ -16,6 +16,7 @@
 #include "duckdb/common/adbc/wrappers.hpp"
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <stdlib.h>
 static void ReleaseError(struct AdbcError *error);
 
@@ -138,6 +139,7 @@ struct DuckDBAdbcStreamWrapper {
 	duckdb::DuckDBAdbcConnectionWrapper *conn_wrapper;
 };
 
+static void MaterializeActiveStreamsLocked(duckdb::DuckDBAdbcConnectionWrapper *conn_wrapper);
 static void MaterializeActiveStreams(duckdb::DuckDBAdbcConnectionWrapper *conn_wrapper);
 
 static bool IsInterruptError(const char *message) {
@@ -964,15 +966,18 @@ AdbcStatusCode ConnectionInit(struct AdbcConnection *connection, struct AdbcData
 AdbcStatusCode ConnectionRelease(struct AdbcConnection *connection, struct AdbcError *error) {
 	if (connection && connection->private_data) {
 		auto conn_wrapper = static_cast<duckdb::DuckDBAdbcConnectionWrapper *>(connection->private_data);
-		// Materialize active streams before disconnecting so they remain readable
-		MaterializeActiveStreams(conn_wrapper);
-		// Detach active streams before deleting conn_wrapper to avoid dangling pointers
-		for (auto *stream_wrapper : conn_wrapper->active_streams) {
-			if (stream_wrapper) {
-				stream_wrapper->conn_wrapper = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(conn_wrapper->active_streams_mutex);
+			// Materialize active streams before disconnecting so they remain readable
+			MaterializeActiveStreamsLocked(conn_wrapper);
+			// Detach active streams before deleting conn_wrapper to avoid dangling pointers
+			for (auto *stream_wrapper : conn_wrapper->active_streams) {
+				if (stream_wrapper) {
+					stream_wrapper->conn_wrapper = nullptr;
+				}
 			}
+			conn_wrapper->active_streams.clear();
 		}
-		conn_wrapper->active_streams.clear();
 		auto conn = reinterpret_cast<duckdb::Connection *>(conn_wrapper->connection);
 		duckdb_disconnect(reinterpret_cast<duckdb_connection *>(&conn));
 		delete conn_wrapper;
@@ -1072,15 +1077,16 @@ void release(struct ArrowArrayStream *stream) {
 	}
 	auto result_wrapper = reinterpret_cast<DuckDBAdbcStreamWrapper *>(stream->private_data);
 	if (result_wrapper) {
-		// Unregister from connection's active_streams
+		// Unregister from connection's active_streams under lock
 		if (result_wrapper->conn_wrapper) {
+			std::lock_guard<std::mutex> lock(result_wrapper->conn_wrapper->active_streams_mutex);
 			auto &active = result_wrapper->conn_wrapper->active_streams;
 			auto it = std::find(active.begin(), active.end(), result_wrapper);
 			if (it != active.end()) {
 				active.erase(it);
 			}
 		}
-		// Clean up materialized data if present
+		// Clean up materialized data if present (no lock needed — this stream is exclusively ours now)
 		if (result_wrapper->materialized) {
 			auto mat = result_wrapper->materialized;
 			for (idx_t i = mat->current; i < mat->count; i++) {
@@ -1509,7 +1515,8 @@ static AdbcStatusCode IngestToTableFromBoundStream(DuckDBAdbcStatementWrapper *s
 // Materialize all active streams on a connection so that a new query can execute.
 // This fetches remaining data from each streaming result into memory, making the
 // streams independent of the connection's active query context.
-static void MaterializeActiveStreams(duckdb::DuckDBAdbcConnectionWrapper *conn_wrapper) {
+// Caller must hold conn_wrapper->active_streams_mutex.
+static void MaterializeActiveStreamsLocked(duckdb::DuckDBAdbcConnectionWrapper *conn_wrapper) {
 	for (auto *result_wrapper : conn_wrapper->active_streams) {
 		if (!result_wrapper || result_wrapper->materialized) {
 			continue;
@@ -1573,6 +1580,11 @@ static void MaterializeActiveStreams(duckdb::DuckDBAdbcConnectionWrapper *conn_w
 		}
 		result_wrapper->materialized = mat;
 	}
+}
+
+static void MaterializeActiveStreams(duckdb::DuckDBAdbcConnectionWrapper *conn_wrapper) {
+	std::lock_guard<std::mutex> lock(conn_wrapper->active_streams_mutex);
+	MaterializeActiveStreamsLocked(conn_wrapper);
 }
 
 AdbcStatusCode StatementExecuteQuery(struct AdbcStatement *statement, struct ArrowArrayStream *out,
@@ -1755,6 +1767,7 @@ AdbcStatusCode StatementExecuteQuery(struct AdbcStatement *statement, struct Arr
 		out->get_last_error = get_last_error;
 		// Register this stream wrapper so it can be materialized if another query runs
 		if (wrapper->conn_wrapper) {
+			std::lock_guard<std::mutex> lock(wrapper->conn_wrapper->active_streams_mutex);
 			wrapper->conn_wrapper->active_streams.push_back(stream_wrapper);
 		}
 	} else {
